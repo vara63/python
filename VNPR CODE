@@ -1,0 +1,324 @@
+import tkinter as tk
+from tkinter import messagebox
+import cv2
+import numpy as np
+import pytesseract
+import imutils
+from PIL import Image, ImageTk
+import re
+import time
+import json
+import os
+
+# Set path to Tesseract executable
+pytesseract.pytesseract.tesseract_cmd = r'D:\Tesseract-OCR\tesseract.exe'
+
+# Global variables for credentials and video state
+stored_username = None
+stored_password = None
+video_running = False
+history_file = "license_plate_history.json"
+
+def is_valid_license_plate(license_plate_text):
+    pattern = re.compile(r'^[A-Z]{2}\d{2}[A-Z]{1,2}\d{4}$')
+    return pattern.match(license_plate_text) is not None
+
+def preprocess(image):
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    edged = cv2.Canny(blurred, 50, 150)
+    return edged
+
+def detect_license_plate(image):
+    contours = cv2.findContours(image.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours = imutils.grab_contours(contours)
+    
+    if contours:
+        contours = sorted(contours, key=cv2.contourArea, reverse=True)[:1]
+        for contour in contours:
+            peri = cv2.arcLength(contour, True)
+            approx = cv2.approxPolyDP(contour, 0.02 * peri, True)
+            if len(approx) == 4:
+                return approx
+    return None
+
+def extract_license_plate(image, contour):
+    mask = np.zeros_like(image)
+    cv2.drawContours(mask, [contour], -1, (255, 255, 255), -1)
+    masked_image = cv2.bitwise_and(image, mask)
+    gray = cv2.cvtColor(masked_image, cv2.COLOR_BGR2GRAY)
+    thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)[1]
+    return thresh
+
+def recognize_license_plate(image, contour):
+    x, y, w, h = cv2.boundingRect(contour)
+    license_plate_roi = image[y:y+h, x:x+w]
+    license_plate_text = pytesseract.image_to_string(license_plate_roi, config='--psm 8 --oem 3')
+    license_plate_text = re.sub(r'[^a-zA-Z0-9]', '', license_plate_text)
+    return license_plate_text.strip()
+
+def center_text_in_listbox(listbox, text, width=30, include_timestamp=False):
+    if include_timestamp:
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        entry = f"{text} - {timestamp}"
+    else:
+        entry = text
+    
+    spaces = (width - len(entry)) // 2
+    centered_text = ' ' * spaces + entry
+    listbox.insert(tk.END, centered_text)
+    listbox.see(tk.END)
+
+def video_loop():
+    global video_running
+    if video_running:
+        ret, frame = cap.read()
+        if not ret:
+            print("Error: Frame not captured.")
+            return
+        
+        processed_frame = preprocess(frame)
+        contour = detect_license_plate(processed_frame)
+        
+        if contour is not None:
+            license_plate = extract_license_plate(frame, contour)
+            license_plate_text = recognize_license_plate(frame, contour)
+            
+            if is_valid_license_plate(license_plate_text):
+                center_text_in_listbox(valid_license_plate_listbox, license_plate_text, include_timestamp=True)
+        
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        frame_pil = Image.fromarray(frame)
+        frame_tk = ImageTk.PhotoImage(image=frame_pil)
+        video_label.imgtk = frame_tk
+        video_label.config(image=frame_tk)
+    
+    video_label.after(10, video_loop)
+
+def start_video():
+    global video_running
+    video_running = True
+    video_loop()
+
+def stop_video():
+    global video_running
+    video_running = False
+
+def set_credentials():
+    global stored_username, stored_password
+    
+    username = set_username_entry.get()
+    password = set_password_entry.get()
+    
+    if not username or not password:
+        messagebox.showerror("Set Credentials", "Both username and password must be provided!")
+        return
+    
+    stored_username = username
+    stored_password = password
+    
+    messagebox.showinfo("Set Credentials", "Credentials set successfully!")
+    set_credentials_frame.pack_forget()
+    show_login_frame()
+
+def authenticate():
+    global stored_username, stored_password
+    
+    username = login_username_entry.get()
+    password = login_password_entry.get()
+    
+    if username == stored_username and password == stored_password:
+        messagebox.showinfo("Login Info", "Authentication successful!")
+        login_frame.pack_forget()
+        video_frame.pack(fill=tk.BOTH, expand=True)
+        start_video()
+    else:
+        messagebox.showerror("Login Info", "Authentication failed!")
+
+def check_login_fields(*args):
+    if login_username_entry.get() and login_password_entry.get():
+        login_button.config(state=tk.NORMAL)
+    else:
+        login_button.config(state=tk.DISABLED)
+
+def show_login_frame():
+    login_frame.pack(fill=tk.BOTH, expand=True)
+
+def clear_history():
+    history_listbox.delete(0, tk.END)
+    valid_license_plate_listbox.delete(0, tk.END)
+    if os.path.exists(history_file):
+        os.remove(history_file)
+    messagebox.showinfo("Clear History", "History cleared successfully!")
+
+def exit_app():
+    cap.release()
+    root.destroy()
+
+def save_license_plate(entry):
+    if not os.path.exists(history_file):
+        with open(history_file, 'w') as f:
+            json.dump([], f)
+    
+    with open(history_file, 'r') as f:
+        data = json.load(f)
+    
+    data.append(entry)
+    
+    with open(history_file, 'w') as f:
+        json.dump(data, f)
+
+def load_license_plates():
+    if os.path.exists(history_file):
+        with open(history_file, 'r') as f:
+            data = json.load(f)
+            for entry in data:
+                if " - " in entry:  # Check for timestamp format
+                    license_plate_text, timestamp = entry.split(" - ")
+                    center_text_in_listbox(history_listbox, license_plate_text.strip())
+                else:
+                    center_text_in_listbox(history_listbox, entry.strip())
+
+def search_license_plate():
+    search_text = search_entry.get().strip()
+    if not search_text:
+        messagebox.showwarning("Search Warning", "Please enter a license plate to search!")
+        return
+    
+    found = False
+    for entry in history_listbox.get(0, tk.END):
+        if search_text in entry:
+            messagebox.showinfo("Search Result", f"Found: {entry}")
+            found = True
+            break
+    
+    if not found:
+        messagebox.showinfo("Search Result", "License plate not found in history.")
+
+# Main window setup
+root = tk.Tk()
+root.title("License Plate Recognition System")
+root.geometry("1000x600")
+root.configure(bg='#f0f0f0')
+
+# Create exit button
+exit_button = tk.Button(root, text="Exit", command=exit_app, font=("Helvetica", 12), bg='light blue', fg='black')
+exit_button.pack(anchor='ne', padx=10, pady=10)
+
+# Create a frame for setting credentials
+set_credentials_frame = tk.Frame(root, bg='#f0f0f0')
+set_credentials_frame.place(relx=0.5, rely=0.5, anchor=tk.CENTER)
+
+# UI for setting credentials
+set_username_label = tk.Label(set_credentials_frame, text="Set Username:", font=("Helvetica", 16), bg='#f0f0f0')
+set_username_label.pack(pady=5)
+
+set_username_entry = tk.Entry(set_credentials_frame, font=("Helvetica", 16))
+set_username_entry.pack(pady=5)
+
+set_password_label = tk.Label(set_credentials_frame, text="Set Password:", font=("Helvetica", 16), bg='#f0f0f0')
+set_password_label.pack(pady=5)
+
+set_password_entry = tk.Entry(set_credentials_frame, show="*", font=("Helvetica", 16))
+set_password_entry.pack(pady=5)
+
+set_credentials_button = tk.Button(set_credentials_frame, text="Set Credentials", command=set_credentials, font=("Helvetica", 16), bg='light blue', fg='black')
+set_credentials_button.pack(pady=20)
+
+# Frame for login
+login_frame = tk.Frame(root, bg='#f0f0f0')
+
+login_username_label = tk.Label(login_frame, text="Username:", font=("Helvetica", 16), bg='#f0f0f0')
+login_username_label.pack(pady=5)
+
+login_username_entry = tk.Entry(login_frame, font=("Helvetica", 16))
+login_username_entry.pack(pady=5)
+login_username_entry.bind("<KeyRelease>", check_login_fields)
+
+login_password_label = tk.Label(login_frame, text="Password:", font=("Helvetica", 16), bg='#f0f0f0')
+login_password_label.pack(pady=5)
+
+login_password_entry = tk.Entry(login_frame, show="*", font=("Helvetica", 16))
+login_password_entry.pack(pady=5)
+login_password_entry.bind("<KeyRelease>", check_login_fields)
+
+login_button = tk.Button(login_frame, text="Login", command=authenticate, font=("Helvetica", 16), bg='light blue', fg='black')
+login_button.pack(pady=20)
+login_button.config(state=tk.DISABLED)
+
+# Frame for video and history
+video_frame = tk.Frame(root, bg='#f0f0f0')
+
+license_plate_label = tk.Label(video_frame, text="License Plate Text: ", font=("Helvetica", 16), bg='#f0f0f0')
+license_plate_label.pack(pady=10)
+
+video_label = tk.Label(video_frame, bg='#f0f0f0')
+video_label.pack(pady=10, padx=10, fill=tk.BOTH, expand=True)
+
+control_frame = tk.Frame(video_frame, bg='#f0f0f0')
+control_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=10, pady=10)
+
+button_frame = tk.Frame(control_frame, bg='#f0f0f0')
+button_frame.pack(side=tk.RIGHT, padx=10, pady=10, fill=tk.Y)
+
+start_button = tk.Button(button_frame, text="Start", command=start_video, font=("Helvetica", 16), bg='light blue', fg='black')
+start_button.pack(side=tk.TOP, pady=5, fill=tk.X)
+
+stop_button = tk.Button(button_frame, text="Stop", command=stop_video, font=("Helvetica", 16), bg='light blue', fg='black')
+stop_button.pack(side=tk.TOP, pady=5, fill=tk.X)
+
+clear_history_button = tk.Button(button_frame, text="Clear History", command=clear_history, font=("Helvetica", 16), bg='light blue', fg='black')
+clear_history_button.pack(side=tk.TOP, pady=5, fill=tk.X)
+
+search_label = tk.Label(button_frame, text="Search License Plate:", font=("Helvetica", 14), bg='#f0f0f0')
+search_label.pack(pady=5)
+
+search_entry = tk.Entry(button_frame, font=("Helvetica", 14))
+search_entry.pack(pady=5)
+
+search_button = tk.Button(button_frame, text="Search", command=search_license_plate, font=("Helvetica", 14), bg='light blue', fg='black')
+search_button.pack(pady=10)
+
+listbox_frame = tk.Frame(video_frame, bg='#f0f0f0')
+listbox_frame.pack(side=tk.TOP, pady=10, fill=tk.X)
+
+history_frame = tk.Frame(listbox_frame, bg='#f0f0f0')
+history_frame.pack(side=tk.LEFT, padx=10, pady=10, fill=tk.BOTH, expand=True)
+
+history_label = tk.Label(history_frame, text="History", font=("Helvetica", 16), bg='#f0f0f0')
+history_label.pack(pady=10)
+
+history_scrollbar = tk.Scrollbar(history_frame)
+history_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+history_listbox = tk.Listbox(history_frame, yscrollcommand=history_scrollbar.set, font=("Helvetica", 12), height=15, width=30)
+history_listbox.pack(fill=tk.BOTH, expand=True)
+history_scrollbar.config(command=history_listbox.yview)
+
+valid_license_plate_frame = tk.Frame(listbox_frame, bg='#f0f0f0')
+valid_license_plate_frame.pack(side=tk.RIGHT, padx=10, pady=10, fill=tk.BOTH, expand=True)
+
+valid_license_plate_label = tk.Label(valid_license_plate_frame, text="Valid License Plates", font=("Helvetica", 16), bg='#f0f0f0')
+valid_license_plate_label.pack(pady=10)
+
+valid_license_plate_scrollbar = tk.Scrollbar(valid_license_plate_frame)
+valid_license_plate_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+valid_license_plate_listbox = tk.Listbox(valid_license_plate_frame, yscrollcommand=valid_license_plate_scrollbar.set, font=("Helvetica", 12), height=15, width=30)
+valid_license_plate_listbox.pack(fill=tk.BOTH, expand=True)
+valid_license_plate_scrollbar.config(command=valid_license_plate_listbox.yview)
+
+# Initialize video capture
+cap = cv2.VideoCapture(0)
+
+if not cap.isOpened():
+    print("Error: Could not open video.")
+
+# Load previous license plates
+load_license_plates()
+
+# Show set credentials frame
+set_credentials_frame.pack()
+
+# Run the Tkinter event loop
+root.mainloop()
